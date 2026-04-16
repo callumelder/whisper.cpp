@@ -108,8 +108,9 @@ local function refreshMenu()
 end
 
 local function notify(text)
-  hs.alert.closeAll()
-  hs.alert.show(text, 1.2)
+  if text then
+    print("whisper_dictation: " .. text)
+  end
 end
 
 local function restoreClipboard(previous)
@@ -122,8 +123,9 @@ end
 
 local function pasteText(text)
   local previous = hs.pasteboard.getContents()
+  local output = text .. " "
 
-  hs.pasteboard.setContents(text)
+  hs.pasteboard.setContents(output)
 
   hs.timer.doAfter(0.05, function()
     hs.eventtap.keyStroke({ "cmd" }, "v", 0)
