@@ -1,0 +1,319 @@
+local M = {}
+
+local state = {
+  menubar = nil,
+  recordTask = nil,
+  transcribeTask = nil,
+  recordFile = nil,
+  shouldTranscribe = false,
+  lastText = nil,
+}
+
+local defaults = {
+  repo = "/Users/cal/dev/whisper.cpp",
+  ffmpeg = "/opt/homebrew/bin/ffmpeg",
+  recorder = "/opt/homebrew/bin/rec",
+  shell = "/bin/zsh",
+  micIndex = 0,
+  threads = 8,
+  tempDir = os.getenv("HOME") .. "/Library/Caches/whisper-dictation",
+  maxRecordSeconds = 15,
+  model = "/Users/cal/dev/whisper.cpp/models/ggml-small.en.bin",
+  vadModel = "/Users/cal/dev/whisper.cpp/models/ggml-silero-v6.2.0.bin",
+  language = "en",
+  hotkey = {
+    mods = { "ctrl", "alt" },
+    key = "space",
+  },
+}
+
+local config = {}
+
+local function mergeConfig(overrides)
+  config = {}
+  for key, value in pairs(defaults) do
+    config[key] = value
+  end
+  if overrides then
+    for key, value in pairs(overrides) do
+      config[key] = value
+    end
+  end
+  config.transcribeScript = config.repo .. "/tools/macos-dictation/transcribe-file.sh"
+  if not (overrides and overrides.model) then
+    config.model = config.repo .. "/models/ggml-small.en.bin"
+  end
+  if not (overrides and overrides.vadModel) then
+    config.vadModel = config.repo .. "/models/ggml-silero-v6.2.0.bin"
+  end
+end
+
+local function cleanText(text)
+  if not text then
+    return ""
+  end
+
+  text = text:gsub("%s+", " ")
+  text = text:gsub("^%s+", "")
+  text = text:gsub("%s+$", "")
+
+  return text
+end
+
+local function shellQuote(value)
+  return string.format("%q", value)
+end
+
+local function ensureTempDir()
+  hs.fs.mkdir(config.tempDir)
+end
+
+local function setStatus(label)
+  if not state.menubar then
+    state.menubar = hs.menubar.new()
+  end
+
+  state.menubar:setTitle(label)
+  state.menubar:setTooltip("Whisper dictation")
+end
+
+local toggleDictation
+
+local function refreshMenu()
+  if not state.menubar then
+    return
+  end
+
+  state.menubar:setMenu({
+    {
+      title = "Toggle Dictation",
+      fn = toggleDictation,
+    },
+    {
+      title = "Input: macOS default microphone",
+      disabled = true,
+    },
+    {
+      title = "Model: ggml-small.en.bin",
+      disabled = true,
+    },
+    {
+      title = "Threads: " .. tostring(config.threads),
+      disabled = true,
+    },
+    {
+      title = "Record Window: " .. tostring(config.maxRecordSeconds) .. "s",
+      disabled = true,
+    },
+    {
+      title = "Reload Config",
+      fn = hs.reload,
+    },
+  })
+end
+
+local function notify(text)
+  hs.alert.closeAll()
+  hs.alert.show(text, 1.2)
+end
+
+local function restoreClipboard(previous)
+  if previous and previous ~= "" then
+    hs.pasteboard.setContents(previous)
+  else
+    hs.pasteboard.clearContents()
+  end
+end
+
+local function pasteText(text)
+  local previous = hs.pasteboard.getContents()
+
+  hs.pasteboard.setContents(text)
+
+  hs.timer.doAfter(0.05, function()
+    hs.eventtap.keyStroke({ "cmd" }, "v", 0)
+    hs.timer.doAfter(0.2, function()
+      restoreClipboard(previous)
+    end)
+  end)
+end
+
+local function finishTranscription(exitCode, stdOut, stdErr)
+  local text = cleanText(stdOut)
+  state.transcribeTask = nil
+  setStatus("V2T")
+  refreshMenu()
+
+  if exitCode ~= 0 then
+    notify("Dictation failed")
+    if stdErr and stdErr ~= "" then
+      print(stdErr)
+    end
+    return
+  end
+
+  if text == "" then
+    notify("No speech detected")
+    return
+  end
+
+  state.lastText = text
+  pasteText(text)
+  notify("Dictation pasted")
+end
+
+local function transcribeFile(audioFile)
+  setStatus("V2T...")
+  refreshMenu()
+
+  local command = table.concat({
+    "WHISPER_DICTATION_THREADS=" .. shellQuote(tostring(config.threads)),
+    "WHISPER_DICTATION_MODEL=" .. shellQuote(config.model),
+    "WHISPER_DICTATION_VAD_MODEL=" .. shellQuote(config.vadModel),
+    "WHISPER_DICTATION_LANGUAGE=" .. shellQuote(config.language),
+    shellQuote(config.transcribeScript),
+    shellQuote(audioFile),
+  }, " ")
+
+  state.transcribeTask = hs.task.new(
+    config.shell,
+    function(exitCode, stdOut, stdErr)
+      finishTranscription(exitCode, stdOut, stdErr)
+      if audioFile then
+        os.remove(audioFile)
+      end
+    end,
+    { "-lc", command }
+  )
+
+  if not state.transcribeTask:start() then
+    state.transcribeTask = nil
+    setStatus("V2T")
+    refreshMenu()
+    notify("Could not start transcription")
+  end
+end
+
+local function finishRecording(exitCode, _, stdErr)
+  local audioFile = state.recordFile
+  local shouldTranscribe = state.shouldTranscribe
+
+  state.recordTask = nil
+  state.recordFile = nil
+  state.shouldTranscribe = false
+
+  if exitCode ~= 0 and not shouldTranscribe then
+    setStatus("V2T")
+    refreshMenu()
+    notify("Recording failed")
+    if stdErr and stdErr ~= "" then
+      print(stdErr)
+    end
+    if audioFile then
+      os.remove(audioFile)
+    end
+    return
+  end
+
+  if shouldTranscribe and audioFile then
+    transcribeFile(audioFile)
+  else
+    setStatus("V2T")
+    refreshMenu()
+  end
+end
+
+local function startRecording()
+  if state.transcribeTask then
+    notify("Still transcribing")
+    return
+  end
+
+  if state.recordTask then
+    return
+  end
+
+  ensureTempDir()
+
+  local timestamp = os.date("%Y%m%d-%H%M%S")
+  local audioFile = string.format("%s/dictation-%s.wav", config.tempDir, timestamp)
+
+  state.recordFile = audioFile
+  state.shouldTranscribe = true
+  state.recordTask = hs.task.new(
+    config.recorder,
+    finishRecording,
+    {
+      "-q",
+      "-c", "1",
+      "-b", "16",
+      audioFile,
+      "rate", "16000",
+      "trim", "0", tostring(config.maxRecordSeconds),
+    }
+  )
+
+  if not state.recordTask:start() then
+    state.recordTask = nil
+    state.recordFile = nil
+    state.shouldTranscribe = false
+    notify("Could not start recording")
+    return
+  end
+
+  setStatus("REC")
+  refreshMenu()
+  notify("Recording")
+end
+
+local function stopRecording()
+  notify("Dictation is already running")
+end
+
+toggleDictation = function()
+  if not state.recordTask and not state.transcribeTask then
+    startRecording()
+  else
+    stopRecording()
+  end
+end
+
+function M.setup(overrides)
+  mergeConfig(overrides)
+  ensureTempDir()
+  setStatus("V2T")
+  refreshMenu()
+
+  hs.hotkey.bind(config.hotkey.mods, config.hotkey.key, toggleDictation)
+
+  _G.whisper_dictation = {
+    start = startRecording,
+    stop = stopRecording,
+    toggle = toggleDictation,
+    status = function()
+      local pid = nil
+      local running = false
+      if state.recordTask then
+        pid = state.recordTask:pid()
+        running = state.recordTask:isRunning()
+      end
+      return {
+        recording = state.recordTask ~= nil,
+        recordTaskRunning = running,
+        pid = pid,
+        transcribing = state.transcribeTask ~= nil,
+        lastText = state.lastText,
+      }
+    end,
+  }
+
+  print(string.format(
+    "whisper_dictation loaded | repo=%s | mic=%s | hotkey=%s+%s",
+    config.repo,
+    tostring(config.micIndex),
+    table.concat(config.hotkey.mods, "+"),
+    config.hotkey.key
+  ))
+end
+
+return M
