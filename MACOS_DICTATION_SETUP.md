@@ -18,9 +18,9 @@ This checkout now includes a local dictation workflow built on top of `whisper.c
 
 ## Default dictation behavior
 
-- hold `fn`
-- while `fn` is down: record from the current macOS default microphone
-- when you release `fn`: stop recording immediately, transcribe locally, and paste the text into the frontmost app
+- hold `control + option`
+- while both keys are down: record from the current macOS default microphone
+- when you release either key: stop recording immediately, transcribe locally, and paste the text into the frontmost app
 - default model: `small.en` with VAD and Core ML encoder acceleration
 - recorder: Python `sounddevice` + `soundfile`
 
@@ -50,7 +50,5 @@ When you return, macOS may still ask Hammerspoon for:
 
 - Accessibility access, so it can paste into the active app
 - Microphone access, if macOS attributes mic capture to Hammerspoon rather than the spawned Python recorder
-
-If `fn` opens the emoji picker or triggers another Globe action instead of dictation, change macOS Keyboard settings so the Globe/fn key is not reserved by the system.
 
 If the hotkey does nothing, open `Hammerspoon.app` once and accept those prompts.

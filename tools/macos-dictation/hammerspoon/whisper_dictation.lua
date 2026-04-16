@@ -6,8 +6,8 @@ local state = {
   transcribeTask = nil,
   recordFile = nil,
   stopFile = nil,
-  fnWatcher = nil,
-  fnIsDown = false,
+  comboWatcher = nil,
+  comboIsDown = false,
   shouldTranscribe = false,
   lastText = nil,
 }
@@ -85,7 +85,7 @@ local function refreshMenu()
 
   state.menubar:setMenu({
     {
-      title = "Mode: Hold fn to dictate",
+      title = "Mode: Hold ctrl+option to dictate",
       disabled = true,
     },
     {
@@ -281,27 +281,27 @@ local function stopRecording()
   notify("Transcribing")
 end
 
-local function fnOnly(flags)
-  return flags.fn
+local function ctrlAltOnly(flags)
+  return flags.ctrl
+    and flags.alt
     and not flags.cmd
-    and not flags.alt
     and not flags.shift
-    and not flags.ctrl
+    and not flags.fn
     and not flags.capslock
 end
 
 local function handleFlagsChanged(event)
   local flags = event:getFlags()
-  local fnDown = fnOnly(flags)
+  local comboDown = ctrlAltOnly(flags)
 
-  if fnDown and not state.fnIsDown then
-    state.fnIsDown = true
+  if comboDown and not state.comboIsDown then
+    state.comboIsDown = true
     startRecording()
     return true
   end
 
-  if not fnDown and state.fnIsDown then
-    state.fnIsDown = false
+  if not comboDown and state.comboIsDown then
+    state.comboIsDown = false
     stopRecording()
     return true
   end
@@ -315,12 +315,12 @@ function M.setup(overrides)
   setStatus("V2T")
   refreshMenu()
 
-  if state.fnWatcher then
-    state.fnWatcher:stop()
+  if state.comboWatcher then
+    state.comboWatcher:stop()
   end
 
-  state.fnWatcher = hs.eventtap.new({ hs.eventtap.event.types.flagsChanged }, handleFlagsChanged)
-  state.fnWatcher:start()
+  state.comboWatcher = hs.eventtap.new({ hs.eventtap.event.types.flagsChanged }, handleFlagsChanged)
+  state.comboWatcher:start()
 
   _G.whisper_dictation = {
     start = startRecording,
@@ -344,7 +344,7 @@ function M.setup(overrides)
   }
 
   print(string.format(
-    "whisper_dictation loaded | repo=%s | mode=hold-fn",
+    "whisper_dictation loaded | repo=%s | mode=hold-ctrl-alt",
     config.repo
   ))
 end
