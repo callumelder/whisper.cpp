@@ -5,26 +5,22 @@ local state = {
   recordTask = nil,
   transcribeTask = nil,
   recordFile = nil,
+  stopFile = nil,
+  fnWatcher = nil,
+  fnIsDown = false,
   shouldTranscribe = false,
   lastText = nil,
 }
 
 local defaults = {
   repo = "/Users/cal/dev/whisper.cpp",
-  ffmpeg = "/opt/homebrew/bin/ffmpeg",
-  recorder = "/opt/homebrew/bin/rec",
+  python = "/Users/cal/dev/whisper.cpp/.venv-coreml/bin/python3.11",
   shell = "/bin/zsh",
-  micIndex = 0,
   threads = 8,
   tempDir = os.getenv("HOME") .. "/Library/Caches/whisper-dictation",
-  maxRecordSeconds = 15,
   model = "/Users/cal/dev/whisper.cpp/models/ggml-small.en.bin",
   vadModel = "/Users/cal/dev/whisper.cpp/models/ggml-silero-v6.2.0.bin",
   language = "en",
-  hotkey = {
-    mods = { "ctrl", "alt" },
-    key = "space",
-  },
 }
 
 local config = {}
@@ -34,15 +30,20 @@ local function mergeConfig(overrides)
   for key, value in pairs(defaults) do
     config[key] = value
   end
+
   if overrides then
     for key, value in pairs(overrides) do
       config[key] = value
     end
   end
+
+  config.recordScript = config.repo .. "/tools/macos-dictation/record-mic.py"
   config.transcribeScript = config.repo .. "/tools/macos-dictation/transcribe-file.sh"
+
   if not (overrides and overrides.model) then
     config.model = config.repo .. "/models/ggml-small.en.bin"
   end
+
   if not (overrides and overrides.vadModel) then
     config.vadModel = config.repo .. "/models/ggml-silero-v6.2.0.bin"
   end
@@ -77,8 +78,6 @@ local function setStatus(label)
   state.menubar:setTooltip("Whisper dictation")
 end
 
-local toggleDictation
-
 local function refreshMenu()
   if not state.menubar then
     return
@@ -86,8 +85,8 @@ local function refreshMenu()
 
   state.menubar:setMenu({
     {
-      title = "Toggle Dictation",
-      fn = toggleDictation,
+      title = "Mode: Hold fn to dictate",
+      disabled = true,
     },
     {
       title = "Input: macOS default microphone",
@@ -99,10 +98,6 @@ local function refreshMenu()
     },
     {
       title = "Threads: " .. tostring(config.threads),
-      disabled = true,
-    },
-    {
-      title = "Record Window: " .. tostring(config.maxRecordSeconds) .. "s",
       disabled = true,
     },
     {
@@ -200,6 +195,7 @@ local function finishRecording(exitCode, _, stdErr)
 
   state.recordTask = nil
   state.recordFile = nil
+  state.stopFile = nil
   state.shouldTranscribe = false
 
   if exitCode ~= 0 and not shouldTranscribe then
@@ -237,26 +233,25 @@ local function startRecording()
 
   local timestamp = os.date("%Y%m%d-%H%M%S")
   local audioFile = string.format("%s/dictation-%s.wav", config.tempDir, timestamp)
+  local stopFile = string.format("%s/dictation-%s.stop", config.tempDir, timestamp)
 
   state.recordFile = audioFile
-  state.shouldTranscribe = true
+  state.stopFile = stopFile
+  state.shouldTranscribe = false
   state.recordTask = hs.task.new(
-    config.recorder,
+    config.python,
     finishRecording,
     {
-      "-q",
-      "-c", "1",
-      "-b", "16",
-      audioFile,
-      "rate", "16000",
-      "trim", "0", tostring(config.maxRecordSeconds),
+      config.recordScript,
+      "--output", audioFile,
+      "--stop-file", stopFile,
     }
   )
 
   if not state.recordTask:start() then
     state.recordTask = nil
     state.recordFile = nil
-    state.shouldTranscribe = false
+    state.stopFile = nil
     notify("Could not start recording")
     return
   end
@@ -267,15 +262,51 @@ local function startRecording()
 end
 
 local function stopRecording()
-  notify("Dictation is already running")
+  if not state.recordTask then
+    return
+  end
+
+  state.shouldTranscribe = true
+  setStatus("V2T...")
+  refreshMenu()
+
+  if state.stopFile then
+    local handle = io.open(state.stopFile, "w")
+    if handle then
+      handle:write("stop\n")
+      handle:close()
+    end
+  end
+
+  notify("Transcribing")
 end
 
-toggleDictation = function()
-  if not state.recordTask and not state.transcribeTask then
+local function fnOnly(flags)
+  return flags.fn
+    and not flags.cmd
+    and not flags.alt
+    and not flags.shift
+    and not flags.ctrl
+    and not flags.capslock
+end
+
+local function handleFlagsChanged(event)
+  local flags = event:getFlags()
+  local fnDown = fnOnly(flags)
+
+  if fnDown and not state.fnIsDown then
+    state.fnIsDown = true
     startRecording()
-  else
-    stopRecording()
+    return true
   end
+
+  if not fnDown and state.fnIsDown then
+    state.fnIsDown = false
+    stopRecording()
+    return true
+  end
+
+  return false
 end
 
 function M.setup(overrides)
@@ -284,12 +315,16 @@ function M.setup(overrides)
   setStatus("V2T")
   refreshMenu()
 
-  hs.hotkey.bind(config.hotkey.mods, config.hotkey.key, toggleDictation)
+  if state.fnWatcher then
+    state.fnWatcher:stop()
+  end
+
+  state.fnWatcher = hs.eventtap.new({ hs.eventtap.event.types.flagsChanged }, handleFlagsChanged)
+  state.fnWatcher:start()
 
   _G.whisper_dictation = {
     start = startRecording,
     stop = stopRecording,
-    toggle = toggleDictation,
     status = function()
       local pid = nil
       local running = false
@@ -297,6 +332,7 @@ function M.setup(overrides)
         pid = state.recordTask:pid()
         running = state.recordTask:isRunning()
       end
+
       return {
         recording = state.recordTask ~= nil,
         recordTaskRunning = running,
@@ -308,11 +344,8 @@ function M.setup(overrides)
   }
 
   print(string.format(
-    "whisper_dictation loaded | repo=%s | mic=%s | hotkey=%s+%s",
-    config.repo,
-    tostring(config.micIndex),
-    table.concat(config.hotkey.mods, "+"),
-    config.hotkey.key
+    "whisper_dictation loaded | repo=%s | mode=hold-fn",
+    config.repo
   ))
 end
 
